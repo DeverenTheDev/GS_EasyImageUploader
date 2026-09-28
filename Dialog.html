@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 14px; padding: 16px; color: #202124; }
+    #drop {
+      border: 2px dashed #9aa0a6; border-radius: 8px; padding: 32px 12px;
+      text-align: center; margin-bottom: 12px;
+    }
+    #drop.over { background: #e8f0fe; border-color: #1a73e8; }
+    #drop.busy { opacity: 0.5; pointer-events: none; }
+    .hint { color: #5f6368; font-size: 12px; margin-top: 8px; }
+    .pick { margin-top: 16px; }
+    .pick button { margin: 0 4px; }
+    #status { margin: 10px 0 6px; min-height: 20px; }
+    #bar { width: 100%; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; display: none; }
+    #fill { height: 100%; width: 0; background: #1a73e8; transition: width 0.2s; }
+    button { background: #fff; color: #1a73e8; border: 1px solid #1a73e8; border-radius: 4px; padding: 8px 18px; font-size: 14px; cursor: pointer; }
+    #log { margin-top: 10px; color: #c5221f; font-size: 12px; max-height: 80px; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="drop">
+    <strong>Drag a folder or images here</strong>
+    <div class="hint">Starts inserting as soon as you drop</div>
+    <div class="pick">
+      <button type="button" id="pickFiles">Choose images</button>
+      <button type="button" id="pickFolder">Choose folder</button>
+    </div>
+    <div class="hint">"Choose folder" makes Chrome show an upload confirmation. Dragging the folder in does not.</div>
+  </div>
+
+  <input type="file" id="filePicker" accept="image/*" multiple style="display:none">
+  <input type="file" id="folderPicker" webkitdirectory style="display:none">
+
+  <div id="count"></div>
+  <div id="status"></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="log"></div>
+
+  <script>
+    const MAX_DIM = 1000;              // downscale anything bigger than this (px)
+    const BATCH_SIZE = 3;              // images sent to the sheet per call
+    const INCLUDE_SUBFOLDERS = false;  // true = also grab images inside subfolders
+    const CLOSE_DELAY_MS = 600;        // pause before the dialog closes itself
+
+    let busy = false;
+    const filePicker = document.getElementById('filePicker');
+    const folderPicker = document.getElementById('folderPicker');
+    const drop = document.getElementById('drop');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const countEl = document.getElementById('count');
+
+    document.getElementById('pickFiles').onclick = () => filePicker.click();
+    document.getElementById('pickFolder').onclick = () => folderPicker.click();
+
+    filePicker.onchange = () => {
+      const list = Array.from(filePicker.files);
+      filePicker.value = '';
+      handleSelection(list);
+    };
+
+    folderPicker.onchange = () => {
+      let list = Array.from(folderPicker.files);
+      folderPicker.value = '';
+      if (!INCLUDE_SUBFOLDERS) {
+        // webkitRelativePath looks like "MyFolder/img.png" (top level) or "MyFolder/sub/img.png"
+        list = list.filter(f => f.webkitRelativePath.split('/').length === 2);
+      }
+      handleSelection(list);
+    };
+
+    drop.ondragover = e => { e.preventDefault(); if (!busy) drop.classList.add('over'); };
+    drop.ondragleave = () => drop.classList.remove('over');
+    drop.ondrop = async e => {
+      e.preventDefault();
+      drop.classList.remove('over');
+      if (busy) return;
+      // Entries must be grabbed before any await, or the browser invalidates them
+      const entries = Array.from(e.dataTransfer.items || [])
+        .map(i => i.webkitGetAsEntry && i.webkitGetAsEntry())
+        .filter(Boolean);
+      if (entries.length === 0) {
+        handleSelection(Array.from(e.dataTransfer.files));
+        return;
+      }
+      const collected = [];
+      for (const entry of entries) await walk(entry, collected, 0);
+      handleSelection(collected);
+    };
+
+    function entryToFile(entry) {
+      return new Promise((resolve, reject) => entry.file(resolve, reject));
+    }
+
+    async function readAllEntries(reader) {
+      const all = [];
+      while (true) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (batch.length === 0) break;
+        all.push(...batch);
+      }
+      return all;
+    }
+
+    async function walk(entry, out, depth) {
+      if (entry.isFile) {
+        out.push(await entryToFile(entry));
+      } else if (entry.isDirectory && (depth === 0 || INCLUDE_SUBFOLDERS)) {
+        const children = await readAllEntries(entry.createReader());
+        for (const child of children) {
+          if (child.isFile || INCLUDE_SUBFOLDERS) await walk(child, out, depth + 1);
+        }
+      }
+    }
+
+    // Filters to images, sorts by name, and starts the upload right away
+    function handleSelection(list) {
+      if (busy) return;
+      const files = list
+        .filter(f => f.type.indexOf('image/') === 0)
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      logEl.textContent = '';
+      if (files.length === 0) {
+        countEl.textContent = '';
+        statusEl.textContent = 'No images found in that selection.';
+        return;
+      }
+      countEl.textContent = files.length + ' image(s) selected';
+      startUpload(files);
+    }
+
+    function readAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(new Error('read failed'));
+        r.readAsDataURL(file);
+      });
+    }
+
+    // Reads the file; downscales it if it's larger than MAX_DIM
+    async function prepare(file) {
+      const original = await readAsDataUrl(file);
+      if (file.type === 'image/gif') return original;
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
+          if (scale === 1 && file.size < 1500000) return resolve(original);
+          const c = document.createElement('canvas');
+          c.width = Math.round(img.width * scale);
+          c.height = Math.round(img.height * scale);
+          c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+          resolve(file.type === 'image/png'
+            ? c.toDataURL('image/png')
+            : c.toDataURL('image/jpeg', 0.9));
+        };
+        img.onerror = () => resolve(original);
+        img.src = original;
+      });
+    }
+
+    function callServer(batch) {
+      return new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .addImages(batch);
+      });
+    }
+
+    async function startUpload(files) {
+      busy = true;
+      drop.classList.add('busy');
+      document.getElementById('bar').style.display = 'block';
+      const fill = document.getElementById('fill');
+      fill.style.width = '0';
+      let done = 0, inserted = 0;
+      const skipped = [];
+
+      for (let i = 0; i < files.length; i += BATCH_SIZE) {
+        const chunk = files.slice(i, i + BATCH_SIZE);
+        statusEl.textContent = 'Processing ' + (i + 1) + '-' +
+          Math.min(i + BATCH_SIZE, files.length) + ' of ' + files.length + '...';
+        try {
+          const batch = [];
+          for (const f of chunk) {
+            batch.push({ name: f.name, dataUri: await prepare(f) });
+          }
+          const res = await callServer(batch);
+          inserted += res.inserted;
+          skipped.push(...res.skipped);
+        } catch (err) {
+          chunk.forEach(f => skipped.push(f.name));
+        }
+        done += chunk.length;
+        fill.style.width = Math.round(done / files.length * 100) + '%';
+      }
+
+      statusEl.textContent = 'Done. Inserted ' + inserted + ' of ' + files.length + ' image(s).';
+
+      if (skipped.length === 0) {
+        // Everything worked: close automatically
+        setTimeout(() => google.script.host.close(), CLOSE_DELAY_MS);
+      } else {
+        // Something was skipped: stay open so you can see which files
+        logEl.textContent = 'Skipped:\n' + skipped.join('\n');
+        busy = false;
+        drop.classList.remove('busy');
+      }
+    }
+  </script>
+</body>
+</html>
